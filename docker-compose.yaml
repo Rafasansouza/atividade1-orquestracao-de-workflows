@@ -1,0 +1,169 @@
+---
+# Airflow 3.4.0 com LocalExecutor.
+# Base: https://airflow.apache.org/docs/apache-airflow/3.4.0/docker-compose.yaml
+# Diferencas em relacao ao arquivo oficial:
+#   - LocalExecutor no lugar de Celery (sem redis, worker e flower);
+#   - DAGs de exemplo desligados;
+#   - dois bancos: db-airflow (metadados) e db-analytics (base analitica);
+#   - o airflow-init tambem cria o pool e a connection usados pelo pipeline.
+#
+# Portas e credenciais saem do .env (veja .env.example); os valores depois do
+# ":-" sao os padroes usados quando o .env nao existe.
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.4.0
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://airflow:airflow@db-airflow/airflow
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__API_AUTH__JWT_SECRET: 'shopbrasil-dev-secret'
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # O pacote shopbrasil nao e DAG, entao mora em src/ e entra no path por aqui.
+    PYTHONPATH: /opt/airflow/src
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./src:/opt/airflow/src
+    - ./logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    db-airflow:
+      condition: service_healthy
+    db-analytics:
+      condition: service_healthy
+
+services:
+  # Banco de metadados do Airflow.
+  db-airflow:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - db-airflow-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # Base analitica: onde o pipeline grava as metricas.
+  db-analytics:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${ANALYTICS_DB_USER:-ecommerce}
+      POSTGRES_PASSWORD: ${ANALYTICS_DB_PASSWORD:-ecommerce}
+      POSTGRES_DB: ${ANALYTICS_DB_NAME:-ecommerce}
+    ports:
+      - "${ANALYTICS_DB_PORT:-5433}:5432"
+    volumes:
+      - db-analytics-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${ANALYTICS_DB_USER:-ecommerce}", "-d", "${ANALYTICS_DB_NAME:-ecommerce}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    user: "0:0"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-airflow}
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs
+
+        # Chamar via /entrypoint aplica _AIRFLOW_DB_MIGRATE e
+        # _AIRFLOW_WWW_USER_CREATE antes do comando.
+        /entrypoint airflow version
+
+        /entrypoint airflow pools set ecommerce_pool 2 \
+          "Limita a concorrencia das tasks mapeadas por categoria"
+
+        /entrypoint airflow connections delete postgres_analitico || true
+        /entrypoint airflow connections add postgres_analitico \
+          --conn-type postgres \
+          --conn-host db-analytics \
+          --conn-port 5432 \
+          --conn-login "${ANALYTICS_DB_USER:-ecommerce}" \
+          --conn-password "${ANALYTICS_DB_PASSWORD:-ecommerce}" \
+          --conn-schema "${ANALYTICS_DB_NAME:-ecommerce}"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  db-airflow-data:
+  db-analytics-data:
